@@ -159,27 +159,63 @@ class FileDiff:
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$")
 
 
-def parse_diff(text: str) -> "OrderedDict[str, FileDiff]":
+def name_status(cfg: list, base: str, head: str) -> list:
+    """(status, old_path, new_path) per changed file, in diff order, from NUL-delimited output: the exact paths, however
+    git would quote or escape them in a text header."""
+    fields = git(*cfg, "diff", "--name-status", "-z", base, head).split("\0")
+    entries, i = [], 0
+    while i < len(fields) and fields[i]:
+        status = fields[i]
+        if status[0] in ("R", "C"):
+            entries.append((status[0], fields[i + 1], fields[i + 2]))
+            i += 3
+        else:
+            entries.append((status[0], fields[i + 1], fields[i + 1]))
+            i += 2
+    return entries
+
+
+def parse_diff(text: str, entries: list) -> "OrderedDict[str, FileDiff]":
+    """Hunks of a unified diff. File identities come from `entries` (name_status, in the order of the diff blocks), so a
+    quoted or escaped path in a text header is never parsed; hunk payload is consumed by the counts the hunk header
+    declares, so a payload line that starts with `--- ` or `+++ ` is content and the trailing empty split item is not."""
     files: "OrderedDict[str, FileDiff]" = OrderedDict()
     cur = None
     hunk = None
-    old_line = new_line = 0
+    old_line = new_line = old_left = new_left = 0
+    block = 0
     for raw in text.split("\n"):
         if raw.startswith("diff --git "):
-            m = re.match(r'^diff --git "?a/(.*?)"? "?b/(.*?)"?$', raw)
-            if not m:
-                raise SystemExit(f"unparsed diff header: {raw}")
-            cur = FileDiff(path=m.group(2), old_path=m.group(1), status="M")
+            if block >= len(entries):
+                raise SystemExit(f"diff has more file blocks than `git diff --name-status` listed: {raw}")
+            status, old_path, path = entries[block]
+            block += 1
+            cur = FileDiff(path=path, old_path=old_path, status=status if status in ("A", "D") else "M")
             files[cur.path] = cur
             hunk = None
             continue
         if cur is None:
             continue
-        if raw.startswith("new file mode"):
-            cur.status = "A"
-        elif raw.startswith("deleted file mode"):
-            cur.status = "D"
-        elif raw.startswith("Binary files"):
+        if hunk is not None and (old_left or new_left):
+            tag = raw[:1] if raw else " "
+            if tag == "\\":  # "\ No newline at end of file"
+                continue
+            text_ = raw[1:]
+            if tag == " ":
+                hunk.lines.append((" ", text_, old_line, new_line))
+                old_line, new_line, old_left, new_left = old_line + 1, new_line + 1, old_left - 1, new_left - 1
+            elif tag == "-":
+                hunk.lines.append(("-", text_, old_line, None))
+                old_line, old_left = old_line + 1, old_left - 1
+            elif tag == "+":
+                hunk.lines.append(("+", text_, None, new_line))
+                new_line, new_left = new_line + 1, new_left - 1
+            else:
+                raise SystemExit(f"unparsed hunk line in {cur.path}: {raw!r}")
+            if old_left < 0 or new_left < 0:
+                raise SystemExit(f"hunk in {cur.path} is longer than its header declares")
+            continue
+        if raw.startswith("Binary files"):
             cur.binary = True
         elif raw.startswith("@@"):
             m = HUNK_RE.match(raw)
@@ -188,18 +224,9 @@ def parse_diff(text: str) -> "OrderedDict[str, FileDiff]":
             hunk = Hunk(int(m.group(1)), int(m.group(2) or 1), int(m.group(3)), int(m.group(4) or 1), m.group(5))
             cur.hunks.append(hunk)
             old_line, new_line = hunk.old_start, hunk.new_start
-        elif hunk is not None and (raw == "" or (raw[:1] in (" ", "+", "-") and not raw.startswith(("--- ", "+++ ")))):
-            tag, text_ = (raw[:1], raw[1:]) if raw else (" ", "")
-            if tag == " ":
-                hunk.lines.append((" ", text_, old_line, new_line))
-                old_line += 1
-                new_line += 1
-            elif tag == "-":
-                hunk.lines.append(("-", text_, old_line, None))
-                old_line += 1
-            else:
-                hunk.lines.append(("+", text_, None, new_line))
-                new_line += 1
+            old_left, new_left = hunk.old_len, hunk.new_len
+    if block != len(entries):
+        raise SystemExit(f"diff has {block} file blocks but `git diff --name-status` listed {len(entries)}")
     return files
 
 
@@ -216,20 +243,34 @@ def symbol_from_funcline(text: str):
     return None
 
 
+STATEMENT_KEYWORDS = ("return", "throw", "throws", "new", "yield", "await", "else", "case", "if", "while", "for", "switch",
+                      "catch", "try", "do", "goto", "break", "continue", "not", "and", "or", "in", "as", "is", "typeof",
+                      "delete", "void", "elif", "elsif", "unless", "until", "when", "raise", "assert", "print", "puts")
+_definition_regexes: dict = {}
+
+
 def definition_regex(name: str) -> re.Pattern:
-    n = re.escape(name)
-    return re.compile(
-        rf"(?:^|[^\w$.])(?:def|func|function|fn|sub|class|module|interface|type|struct|enum|record|trait)\s+(?:\([^)]*\)\s*)?\*?{n}\s*[(<:{{\[=]"
-        rf"|(?:^|[\s,({{])(?:const|let|var|val)\s+{n}\s*(?::[^=]*)?="
-        rf"|^\s*(?:(?:public|private|protected|internal|static|final|abstract|synchronized|async|override|export|default|virtual|native|readonly|get|set)\s+)*(?:[A-Za-z_][\w<>\[\],.?]*\s+)?{n}\s*(?:<[^>]*>)?\([^;]*$"
-        rf"|^\s*{n}\s*(?:=|:)\s*(?:async\s*)?(?:function\b|\()"
-        rf"|(?:^|\s)def\s+self\.{n}\b"
-    )
+    """A line that declares `name`: a keyword-led declaration (def, func, class, ...), a const/let/var/val binding, a
+    typed method declaration where at least one modifier or type token that is not a statement keyword precedes the
+    name, a property bound to a function, a method whose body opens on the same line, or a Ruby singleton method. A
+    bare call `name(...)`, or `return name(...)`, declares nothing and does not match."""
+    if name not in _definition_regexes:
+        n = re.escape(name)
+        kw = "|".join(STATEMENT_KEYWORDS)
+        _definition_regexes[name] = re.compile(
+            rf"(?:^|[^\w$.])(?:def|func|function|fn|fun|sub|class|module|interface|type|struct|enum|record|trait|impl)\s+(?:\([^)]*\)\s*)?\*?{n}\s*[(<:{{\[=]"
+            rf"|(?:^|[\s,({{])(?:const|let|var|val)\s+{n}\s*(?::[^=]*)?="
+            rf"|^\s*(?!(?:{kw})\b)(?:(?:public|private|protected|internal|static|final|abstract|synchronized|async|override|export|default|virtual|native|readonly|get|set|[A-Za-z_][\w<>\[\],.?]*)\s+)+{n}\s*(?:<[^>]*>)?\([^;]*$"
+            rf"|^\s*{n}\s*(?:=|:)\s*(?:async\s*)?(?:function\b|\()"
+            rf"|^\s*{n}\s*(?:<[^>]*>)?\([^;{{}}]*\)\s*(?::\s*[^{{;]+)?\{{\s*$"
+            rf"|(?:^|\s)def\s+self\.{n}\b"
+        )
+    return _definition_regexes[name]
 
 
 def grep_one(head: str, pattern: str) -> list:
     """Whole-word fixed-string git grep over the head tree; returns (path, line, text). Exit 1 means no match."""
-    out = git("grep", "-n", "-I", "-F", "-w", "-e", pattern, head, "--", ".", *NOISE_PATHSPECS, ok_codes=(0, 1))
+    out = git("grep", "--no-color", "-n", "-I", "-F", "-w", "-e", pattern, head, "--", ".", *NOISE_PATHSPECS, ok_codes=(0, 1))
     hits = []
     prefix = head + ":"
     for line in out.split("\n"):
@@ -334,14 +375,15 @@ def main() -> int:
     base = git("rev-parse", "--verify", a.base + "^{commit}").strip()
     head = git("rev-parse", "--verify", a.head + "^{commit}").strip()
 
-    with tempfile.NamedTemporaryFile("w", suffix=".gitattributes", delete=False) as f:
-        f.write(ATTRIBUTES)
-        attr_file = f.name
-    cfg = ["-c", f"core.attributesFile={attr_file}", "-c", f"diff.tsjs.xfuncname={TSJS_XFUNCNAME}"]
-    common = ["--no-color", "--no-ext-diff"]
-    files = parse_diff(git(*cfg, "diff", *common, "--unified=3", base, head))
-    wide = parse_diff(git(*cfg, "diff", *common, "-W", base, head))
-    Path(attr_file).unlink()
+    with tempfile.TemporaryDirectory() as tmp:
+        attr_file = Path(tmp) / "attributes"
+        attr_file.write_text(ATTRIBUTES)
+        cfg = ["-c", f"core.attributesFile={attr_file}", "-c", f"diff.tsjs.xfuncname={TSJS_XFUNCNAME}",
+               "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false"]
+        common = ["--no-color", "--no-ext-diff"]
+        entries = name_status(cfg, base, head)
+        files = parse_diff(git(*cfg, "diff", *common, "--unified=3", base, head), entries)
+        wide = parse_diff(git(*cfg, "diff", *common, "-W", base, head), entries)
 
     changed = sum(1 for fd in files.values() for h in fd.hunks for l in h.lines if l[0] != " ")
     added_at = set()
@@ -357,9 +399,19 @@ def main() -> int:
     for fd in files.values():
         ruby = family(fd.path) == "rb"
         for h in fd.hunks:
-            sym = symbol_from_funcline(h.header)
-            if sym and fd.status != "A":
-                enclosing.setdefault(sym, []).append(f"{fd.path}:{h.new_start}")
+            # the enclosing function of each changed line is the nearest declaration above it: a declaration among the
+            # hunk's own lines (a change near the top of its function) wins over git's hunk heading, which names the
+            # declaration before the hunk
+            current = symbol_from_funcline(h.header)
+            seen: set = set()
+            for tag, text, old, new in h.lines:
+                if tag != "-":
+                    m = def_on_line_re.search(text)
+                    if m and m.group(1) not in KEYWORDS and len(m.group(1)) >= 3:
+                        current = m.group(1)
+                if tag != " " and current and fd.status != "A" and current not in seen:
+                    seen.add(current)
+                    enclosing.setdefault(current, []).append(f"{fd.path}:{new if new is not None else h.new_start}")
             for tag, text, old, new in h.lines:
                 if tag == "+":
                     added_at.add((fd.path, new))
@@ -378,14 +430,15 @@ def main() -> int:
                         literal_removed.setdefault(lit, []).append(f"{fd.old_path}:-{old}")
     for n in list(enclosing):
         callee_candidates.pop(n, None)
-    # within one file, a literal both removed and added is an edited or moved line, and a removed literal contained in an
-    # added one (a URL that gained a path, a key that gained a prefix) is an edit: neither is an introduction or a removal
-    # there. The same literal newly added in another file is still an introduction and is kept.
+    # within one file, a literal both removed and added is an edited or moved line, neither an introduction nor a
+    # removal there. A removed literal that survives only as part of a longer added one (a key that gained a suffix) is
+    # a removal: its remaining occurrences are the consumers the rename left behind. The same literal newly added in
+    # another file is still an introduction and is kept.
     def file_of(where: str) -> str:
         return where.rsplit(":", 1)[0]
     for lit in list(literal_removed):
         removed_files = {file_of(w) for w in literal_removed[lit]}
-        added_files = {file_of(w) for other, ws in literal_added.items() if lit in other for w in ws}
+        added_files = {file_of(w) for w in literal_added.get(lit, [])}
         literal_removed[lit] = [w for w in literal_removed[lit] if file_of(w) not in added_files]
         if not literal_removed[lit]:
             literal_removed.pop(lit)

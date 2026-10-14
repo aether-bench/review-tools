@@ -28,6 +28,6 @@ python3 context_pack.py --base "$(git merge-base origin/main HEAD)" --head HEAD 
     --title "<pull request title>" --body-file pr_body.md --out pack.md
 ```
 
-Requires git and Python 3.9 or later; nothing else. Generated catalogs and snapshots (`*.po`, `*.pot`, `*.pysnap`,
+Requires git and Python 3.9 or later; nothing else. Tests: `python3 -m unittest test_context_pack` (builds small two-commit repositories). Generated catalogs and snapshots (`*.po`, `*.pot`, `*.pysnap`,
 `snapshots/`), lockfiles, minified bundles, source maps and `node_modules`/`vendor`/`dist`/`build` trees are excluded
 from occurrence searches.
