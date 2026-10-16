@@ -217,6 +217,20 @@ class ContextPackTests(unittest.TestCase):
         pack = repo.pack(base)
         self.assertIn("### `openBrace` (called at math.ts:2): 1 definition", pack)
 
+    def test_a_completed_string_without_a_semicolon_ends_its_expression(self):
+        repo, base = two_commit(
+            {"math.ts": 'export const status = () => "ready"\nexport const wrap = (s: string) => s\n'},
+            {"math.ts": 'export const status = () => "ready"\nexport const wrap = (s: string) => status() + s\n'})
+        pack = repo.pack(base)
+        self.assertIn("### `status` (called at math.ts:2): 1 definition", pack)
+
+    def test_a_quote_inside_a_regex_literal_opens_no_string(self):
+        repo, base = two_commit(
+            {"math.ts": 'export const hasQuote = (s: string) => { return /"/.test(s); };\nexport const wrap = (s: string) => s;\n'},
+            {"math.ts": 'export const hasQuote = (s: string) => { return /"/.test(s); };\nexport const wrap = (s: string) => hasQuote(s) ? s : "";\n'})
+        pack = repo.pack(base)
+        self.assertIn("### `hasQuote` (called at math.ts:2): 1 definition", pack)
+
 
 if __name__ == "__main__":
     unittest.main()

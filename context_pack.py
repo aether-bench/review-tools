@@ -423,17 +423,29 @@ def main() -> int:
     def_on_line_re = re.compile(r"(?:^|[^\w$.])(?:def|func|function|fn|class|module|interface|type|struct|enum|record)\s+(?:\([^)]*\)\s*)?\*?([A-Za-z_$][\w$]*)")
     # a binding whose value is a function: `export const total = (items: number[]) => {`, `const load = async function (`
     bound_fn_re = re.compile(r"(?:^|[\s,(])(?:const|let|var|val)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]*)?=\s*(?:async\s*)?(?:function\b|\([^()]*\)\s*(?::[^=]*)?=>|[A-Za-z_$][\w$]*\s*=>)")
+    regex_after_chars = set("(,=:[!&|?{};+-*%<>~^")
+    regex_after_words = {"return", "typeof", "case", "in", "of", "delete", "void", "throw", "new", "else", "do", "instanceof", "yield", "await"}
+
     def code_only(text: str) -> str:
-        """`text` with string literals blanked and comments removed, so a brace counts only where it is code."""
+        """`text` with string and regex literals reduced to empty delimiters and comments removed, so a brace, a
+        parenthesis or a comma counts only where it is code, and a completed literal still ends its expression."""
         out, i, n = [], 0, len(text)
+
+        def regex_may_start() -> bool:
+            code = "".join(out).rstrip()
+            if not code or code[-1] in regex_after_chars:
+                return True
+            m = re.search(r"[A-Za-z_$][\w$]*$", code)
+            return bool(m) and m.group(0) in regex_after_words
+
         while i < n:
             c = text[i]
             if c in "\"'`":
-                out.append(" ")
-                i += 1
-                while i < n and text[i] != c:
-                    i += 2 if text[i] == "\\" else 1
-                i += 1
+                j = i + 1
+                while j < n and text[j] != c:
+                    j += 2 if text[j] == "\\" else 1
+                out.append(c + c)
+                i = j + 1
             elif text.startswith("//", i):
                 break
             elif text.startswith("/*", i):
@@ -441,6 +453,21 @@ def main() -> int:
                 if end < 0:
                     break
                 i = end + 2
+            elif c == "/" and regex_may_start():
+                j, in_class = i + 1, False
+                while j < n and (text[j] != "/" or in_class):
+                    if text[j] == "\\":
+                        j += 2
+                        continue
+                    if text[j] == "[":
+                        in_class = True
+                    elif text[j] == "]":
+                        in_class = False
+                    j += 1
+                out.append("/_/")
+                i = j + 1
+                while i < n and text[i].isalpha():  # flags
+                    i += 1
             else:
                 out.append(c)
                 i += 1
@@ -449,7 +476,7 @@ def main() -> int:
     def declared_on(text: str) -> tuple:
         """(name the line declares or None, whether its body continues past the line). A bound function whose block
         opens on the line and does not close there, or whose parameters or arrow run on, encloses the lines below; a
-        one-line arrow function or a one-line block does not. Braces inside strings and comments are not code."""
+        one-line arrow function or a one-line block does not. Braces inside strings, regexes and comments are not code."""
         m = def_on_line_re.search(text)
         if m and m.group(1) not in KEYWORDS and len(m.group(1)) >= 3:
             return m.group(1), True
