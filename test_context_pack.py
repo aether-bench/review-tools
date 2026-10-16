@@ -202,6 +202,21 @@ class ContextPackTests(unittest.TestCase):
         pack = repo.pack(base)
         self.assertIn("### `computeTotal` (called at math.ts:2): 1 definition", pack)
 
+    def test_a_quoted_brace_in_a_trailing_comment_is_not_code(self):
+        repo, base = two_commit(
+            {"math.ts": 'export const total = (items: number[]) => { // stop at "}"\n  let amount = 0;\n  return amount;\n};\n', "app.ts": 'import { total } from "./math";\n\nexport const value = total([]);\n'},
+            {"math.ts": 'export const total = (items: number[]) => { // stop at "}"\n  let amount = 1;\n  return amount;\n};\n', "app.ts": 'import { total } from "./math";\n\nexport const value = total([]);\n'})
+        pack = repo.pack(base)
+        self.assertIn("- `total` (changed function at math.ts:1): 2 references", pack)
+        self.assertIn("    - app.ts:3: export const value = total([]);", pack)
+
+    def test_a_brace_inside_a_string_literal_opens_no_block(self):
+        repo, base = two_commit(
+            {"math.ts": 'export const openBrace = () => "{";\nexport const wrap = (s: string) => s;\n'},
+            {"math.ts": 'export const openBrace = () => "{";\nexport const wrap = (s: string) => openBrace() + s;\n'})
+        pack = repo.pack(base)
+        self.assertIn("### `openBrace` (called at math.ts:2): 1 definition", pack)
+
 
 if __name__ == "__main__":
     unittest.main()

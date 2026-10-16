@@ -423,18 +423,39 @@ def main() -> int:
     def_on_line_re = re.compile(r"(?:^|[^\w$.])(?:def|func|function|fn|class|module|interface|type|struct|enum|record)\s+(?:\([^)]*\)\s*)?\*?([A-Za-z_$][\w$]*)")
     # a binding whose value is a function: `export const total = (items: number[]) => {`, `const load = async function (`
     bound_fn_re = re.compile(r"(?:^|[\s,(])(?:const|let|var|val)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]*)?=\s*(?:async\s*)?(?:function\b|\([^()]*\)\s*(?::[^=]*)?=>|[A-Za-z_$][\w$]*\s*=>)")
-    trailing_comment_re = re.compile(r"\s+(?://|#)[^\"'`]*$|\s*/\*(?:(?!\*/).)*\*/\s*$")
+    def code_only(text: str) -> str:
+        """`text` with string literals blanked and comments removed, so a brace counts only where it is code."""
+        out, i, n = [], 0, len(text)
+        while i < n:
+            c = text[i]
+            if c in "\"'`":
+                out.append(" ")
+                i += 1
+                while i < n and text[i] != c:
+                    i += 2 if text[i] == "\\" else 1
+                i += 1
+            elif text.startswith("//", i):
+                break
+            elif text.startswith("/*", i):
+                end = text.find("*/", i + 2)
+                if end < 0:
+                    break
+                i = end + 2
+            else:
+                out.append(c)
+                i += 1
+        return "".join(out)
 
     def declared_on(text: str) -> tuple:
         """(name the line declares or None, whether its body continues past the line). A bound function whose block
         opens on the line and does not close there, or whose parameters or arrow run on, encloses the lines below; a
-        one-line arrow function or a one-line block does not. A trailing comment is not part of the code."""
+        one-line arrow function or a one-line block does not. Braces inside strings and comments are not code."""
         m = def_on_line_re.search(text)
         if m and m.group(1) not in KEYWORDS and len(m.group(1)) >= 3:
             return m.group(1), True
         m = bound_fn_re.search(text)
         if m and m.group(1) not in KEYWORDS and len(m.group(1)) >= 3:
-            code = trailing_comment_re.sub("", text).rstrip()
+            code = code_only(text).rstrip()
             return m.group(1), code.count("{") > code.count("}") or code.endswith(("(", ",", "=>"))
         return None, False
 
