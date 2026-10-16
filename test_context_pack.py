@@ -247,6 +247,20 @@ class ContextPackTests(unittest.TestCase):
         self.assertIn("### `ratio` (called at math.ts:3): 1 definition", pack)
         self.assertIn("### `half` (called at math.ts:3): 1 definition", pack)
 
+    def test_a_unary_not_after_return_starts_a_regex(self):
+        repo, base = two_commit(
+            {"math.ts": 'export const noQuote = (s: string) => { return!/"/.test(s); };\nexport const wrap = (s: string) => s;\n'},
+            {"math.ts": 'export const noQuote = (s: string) => { return!/"/.test(s); };\nexport const wrap = (s: string) => noQuote(s) ? s : "";\n'})
+        pack = repo.pack(base)
+        self.assertIn("### `noQuote` (called at math.ts:2): 1 definition", pack)
+
+    def test_an_apostrophe_in_jsx_text_opens_no_string(self):
+        repo, base = two_commit(
+            {"app.tsx": "export const Note = () => <p>it's fine</p>;\nexport const Page = () => null;\n"},
+            {"app.tsx": "export const Note = () => <p>it's fine</p>;\nexport const Page = () => Note();\n"})
+        pack = repo.pack(base)
+        self.assertIn("### `Note` (called at app.tsx:2): 1 definition", pack)
+
 
 if __name__ == "__main__":
     unittest.main()

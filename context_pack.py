@@ -439,8 +439,12 @@ def main() -> int:
             code = "".join(out).rstrip()
             if not code:
                 return True
-            if code[-1] == "!" and len(code) > 1 and operand_chars_re.match(code[-2]):
-                return False
+            if code[-1] == "!" and len(code) > 1:
+                word = re.search(r"([A-Za-z_$][\w$]*)!$", code)
+                if word and word.group(1) in regex_after_words:
+                    return True  # `return!/x/`: a unary not after a keyword
+                if operand_chars_re.match(code[-2]):
+                    return False  # `value!`: a postfix assertion ends the operand
             if code[-2:] in ("++", "--") and len(code) > 2 and operand_chars_re.match(code[-3]):
                 return False
             if code[-1] in regex_after_chars:
@@ -454,9 +458,13 @@ def main() -> int:
                 j = i + 1
                 while j < n and text[j] != c:
                     j += 2 if text[j] == "\\" else 1
-                if j >= n:  # the literal runs on to the next line
+                if j >= n and c == "`":  # the template runs on to the next line
                     out.append(c)
                     return "".join(out), True
+                if j >= n:  # a quote with no partner is text (an apostrophe in JSX), not a string
+                    out.append(" ")
+                    i += 1
+                    continue
                 out.append(c + c)
                 i = j + 1
             elif text.startswith("//", i):
