@@ -231,6 +231,22 @@ class ContextPackTests(unittest.TestCase):
         pack = repo.pack(base)
         self.assertIn("### `hasQuote` (called at math.ts:2): 1 definition", pack)
 
+    def test_a_template_literal_that_runs_on_keeps_its_function_open(self):
+        repo, base = two_commit(
+            {"math.ts": "export const html = () => `\n  <div>a</div>\n`;\n", "app.ts": 'import { html } from "./math";\n\nexport const page = html();\n'},
+            {"math.ts": "export const html = () => `\n  <div>b</div>\n`;\n", "app.ts": 'import { html } from "./math";\n\nexport const page = html();\n'})
+        pack = repo.pack(base)
+        self.assertIn("- `html` (changed function at math.ts:1): 2 references", pack)
+        self.assertIn("    - app.ts:3: export const page = html();", pack)
+
+    def test_a_division_after_a_postfix_operator_is_not_a_regex(self):
+        repo, base = two_commit(
+            {"math.ts": "export const ratio = (value: number | null) => { return value! / 2; };\nexport const half = (i: number) => { i++ / 2; return i; };\nexport const wrap = (v: number) => v;\n"},
+            {"math.ts": "export const ratio = (value: number | null) => { return value! / 2; };\nexport const half = (i: number) => { i++ / 2; return i; };\nexport const wrap = (v: number) => ratio(v) + half(v);\n"})
+        pack = repo.pack(base)
+        self.assertIn("### `ratio` (called at math.ts:3): 1 definition", pack)
+        self.assertIn("### `half` (called at math.ts:3): 1 definition", pack)
+
 
 if __name__ == "__main__":
     unittest.main()

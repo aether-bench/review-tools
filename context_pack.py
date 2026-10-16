@@ -425,15 +425,25 @@ def main() -> int:
     bound_fn_re = re.compile(r"(?:^|[\s,(])(?:const|let|var|val)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]*)?=\s*(?:async\s*)?(?:function\b|\([^()]*\)\s*(?::[^=]*)?=>|[A-Za-z_$][\w$]*\s*=>)")
     regex_after_chars = set("(,=:[!&|?{};+-*%<>~^")
     regex_after_words = {"return", "typeof", "case", "in", "of", "delete", "void", "throw", "new", "else", "do", "instanceof", "yield", "await"}
+    operand_chars_re = re.compile(r"[\w$)\]\"'`]")
 
-    def code_only(text: str) -> str:
-        """`text` with string and regex literals reduced to empty delimiters and comments removed, so a brace, a
-        parenthesis or a comma counts only where it is code, and a completed literal still ends its expression."""
+    def code_only(text: str) -> tuple:
+        """(`text` with string and regex literals reduced to empty delimiters and comments removed, whether a literal is
+        still open at the end of the line). A brace, a parenthesis or a comma then counts only where it is code, a
+        completed literal still ends its expression, and a template that runs on to the next line leaves the line open."""
         out, i, n = [], 0, len(text)
 
         def regex_may_start() -> bool:
+            """A slash starts a regex after an operator, an opening bracket or a keyword, but not after an operand, and
+            a postfix operator (`value!`, `i++`, `i--`) ends an operand."""
             code = "".join(out).rstrip()
-            if not code or code[-1] in regex_after_chars:
+            if not code:
+                return True
+            if code[-1] == "!" and len(code) > 1 and operand_chars_re.match(code[-2]):
+                return False
+            if code[-2:] in ("++", "--") and len(code) > 2 and operand_chars_re.match(code[-3]):
+                return False
+            if code[-1] in regex_after_chars:
                 return True
             m = re.search(r"[A-Za-z_$][\w$]*$", code)
             return bool(m) and m.group(0) in regex_after_words
@@ -444,6 +454,9 @@ def main() -> int:
                 j = i + 1
                 while j < n and text[j] != c:
                     j += 2 if text[j] == "\\" else 1
+                if j >= n:  # the literal runs on to the next line
+                    out.append(c)
+                    return "".join(out), True
                 out.append(c + c)
                 i = j + 1
             elif text.startswith("//", i):
@@ -464,6 +477,10 @@ def main() -> int:
                     elif text[j] == "]":
                         in_class = False
                     j += 1
+                if j >= n:  # no closing slash on the line: a division after all
+                    out.append(c)
+                    i += 1
+                    continue
                 out.append("/_/")
                 i = j + 1
                 while i < n and text[i].isalpha():  # flags
@@ -471,19 +488,21 @@ def main() -> int:
             else:
                 out.append(c)
                 i += 1
-        return "".join(out)
+        return "".join(out), False
 
     def declared_on(text: str) -> tuple:
         """(name the line declares or None, whether its body continues past the line). A bound function whose block
         opens on the line and does not close there, or whose parameters or arrow run on, encloses the lines below; a
-        one-line arrow function or a one-line block does not. Braces inside strings, regexes and comments are not code."""
+        one-line arrow function or a one-line block does not; a template literal that runs on to the next line does.
+        Braces inside strings, regexes and comments are not code."""
         m = def_on_line_re.search(text)
         if m and m.group(1) not in KEYWORDS and len(m.group(1)) >= 3:
             return m.group(1), True
         m = bound_fn_re.search(text)
         if m and m.group(1) not in KEYWORDS and len(m.group(1)) >= 3:
-            code = code_only(text).rstrip()
-            return m.group(1), code.count("{") > code.count("}") or code.endswith(("(", ",", "=>"))
+            code, open_literal = code_only(text)
+            code = code.rstrip()
+            return m.group(1), open_literal or code.count("{") > code.count("}") or code.endswith(("(", ",", "=>"))
         return None, False
 
     for fd in files.values():
