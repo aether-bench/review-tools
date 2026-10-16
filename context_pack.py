@@ -459,7 +459,8 @@ def main() -> int:
                 while j < n and text[j] != c:
                     j += 2 if text[j] == "\\" else 1
                 if j >= n:
-                    continued = (len(text) - len(text.rstrip("\\"))) % 2 == 1  # an escaped newline continues the string
+                    before_eol = text.rstrip("\r")  # a CRLF line keeps its CR; the backslash before it escapes the newline
+                    continued = (len(before_eol) - len(before_eol.rstrip("\\"))) % 2 == 1
                     if c == "`" or continued:  # the literal runs on to the next line
                         out.append(c)
                         return "".join(out), True

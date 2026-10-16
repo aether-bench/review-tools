@@ -269,6 +269,14 @@ class ContextPackTests(unittest.TestCase):
         self.assertIn("- `banner` (changed function at math.ts:1): 2 references", pack)
         self.assertIn("    - app.ts:3: export const page = banner();", pack)
 
+    def test_a_crlf_string_continued_by_an_escaped_newline_keeps_its_function_open(self):
+        repo, base = two_commit(
+            {"math.ts": 'export const banner = () => "first \\\r\n  second";\r\n', "app.ts": 'import { banner } from "./math";\n\nexport const page = banner();\n'},
+            {"math.ts": 'export const banner = () => "first \\\r\n  changed";\r\n', "app.ts": 'import { banner } from "./math";\n\nexport const page = banner();\n'})
+        pack = repo.pack(base)
+        self.assertIn("- `banner` (changed function at math.ts:1): 2 references", pack)
+        self.assertIn("    - app.ts:3: export const page = banner();", pack)
+
 
 if __name__ == "__main__":
     unittest.main()
