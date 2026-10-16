@@ -155,7 +155,7 @@ class FileDiff:
     path: str
     old_path: str
     status: str  # A, M, D, or T for a file that became a symlink or the reverse
-    binary: bool = False
+    binary: bool = False  # a half of a type change may be binary while the other half has text hunks
     hunks: list = field(default_factory=list)
 
 
@@ -424,11 +424,16 @@ def main() -> int:
     # a binding whose value is a function: `export const total = (items: number[]) => {`, `const load = async function (`
     bound_fn_re = re.compile(r"(?:^|[\s,(])(?:const|let|var|val)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]*)?=\s*(?:async\s*)?(?:function\b|\([^()]*\)\s*(?::[^=]*)?=>|[A-Za-z_$][\w$]*\s*=>)")
 
-    def declared_on(text: str):
-        for m in (def_on_line_re.search(text), bound_fn_re.search(text)):
-            if m and m.group(1) not in KEYWORDS and len(m.group(1)) >= 3:
-                return m.group(1)
-        return None
+    def declared_on(text: str) -> tuple:
+        """(name the line declares or None, whether its body continues past the line): a one-line arrow function
+        encloses nothing below it."""
+        m = def_on_line_re.search(text)
+        if m and m.group(1) not in KEYWORDS and len(m.group(1)) >= 3:
+            return m.group(1), True
+        m = bound_fn_re.search(text)
+        if m and m.group(1) not in KEYWORDS and len(m.group(1)) >= 3:
+            return m.group(1), text.rstrip().endswith(("{", "(", ",", "=>"))
+        return None, False
 
     for fd in files.values():
         ruby = family(fd.path) == "rb"
@@ -440,18 +445,20 @@ def main() -> int:
             seen: set = set()
             for tag, text, old, new in h.lines:
                 if tag != "-":
-                    current = declared_on(text) or current
+                    name_, encloses = declared_on(text)
+                    if name_ and encloses:
+                        current = name_
                 if tag != " " and current and fd.status != "A" and current not in seen:
                     seen.add(current)
                     enclosing.setdefault(current, []).append(f"{fd.path}:{new if new is not None else h.new_start}")
             for tag, text, old, new in h.lines:
                 if tag == "+":
                     added_at.add((fd.path, new))
-                    if declared_on(text) is None:
-                        for m in list(call_re.finditer(text)) + list(method_re.finditer(text)):
-                            n = m.group(1)
-                            if n not in KEYWORDS and n not in callee_candidates:
-                                callee_candidates[n] = (f"{fd.path}:{new}", family(fd.path))
+                    declared, _ = declared_on(text)  # the name a line declares is not a call; the rest of the line may be
+                    for m in list(call_re.finditer(text)) + list(method_re.finditer(text)):
+                        n = m.group(1)
+                        if n != declared and n not in KEYWORDS and n not in callee_candidates:
+                            callee_candidates[n] = (f"{fd.path}:{new}", family(fd.path))
                     for lit in literals_on(text, ruby):
                         literal_added.setdefault(lit, []).append(f"{fd.path}:{new}")
                 elif tag == "-":
@@ -518,7 +525,7 @@ def main() -> int:
 
     plain_hunks: dict = {}   # path -> ±3 view, used when the function view is cut for budget
     for fd in files.values():
-        if fd.binary:
+        if not fd.hunks:  # a binary file; a type change from a binary file to a symlink keeps its text half
             continue
         plain = [f"\n## `{fd.path}`\n"]
         for i, h in enumerate(fd.hunks, 1):

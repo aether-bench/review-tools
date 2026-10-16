@@ -26,6 +26,8 @@ class Repo:
             target.parent.mkdir(parents=True, exist_ok=True)
             if body is None:
                 target.unlink()
+            elif isinstance(body, bytes):
+                target.write_bytes(body)
             elif body.startswith("->"):  # a symlink to the rest of the body
                 target.unlink(missing_ok=True)
                 target.symlink_to(body[2:])
@@ -170,6 +172,20 @@ class ContextPackTests(unittest.TestCase):
         pack = repo.pack(base)
         self.assertIn("- `total` (changed function at math.ts:1): 2 references", pack)
         self.assertIn("    - app.ts:3: export const value = total([]);", pack)
+
+    def test_a_one_line_arrow_function_keeps_the_calls_on_its_line(self):
+        repo, base = two_commit(
+            {"math.ts": "export const computeTotal = (items: number[]) => items.length;\nexport const total = (items: number[]) => 0;\n"},
+            {"math.ts": "export const computeTotal = (items: number[]) => items.length;\nexport const total = (items: number[]) => computeTotal(items);\n"})
+        pack = repo.pack(base)
+        self.assertIn("### `computeTotal` (called at math.ts:2): 1 definition", pack)
+        self.assertIn("1| export const computeTotal = (items: number[]) => items.length;", pack)
+
+    def test_a_binary_file_that_became_a_symlink_keeps_its_text_hunk(self):
+        repo, base = two_commit({"blob.bin": b"\x00\x01\x02", "data.txt": "x\n"}, {"blob.bin": "->data.txt"})
+        pack = repo.pack(base)
+        self.assertIn("- `blob.bin` (type changed; +1 -0; 1 hunks; binary)", pack)
+        self.assertIn("+    1| data.txt", pack)
 
 
 if __name__ == "__main__":
