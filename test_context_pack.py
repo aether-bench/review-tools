@@ -187,6 +187,21 @@ class ContextPackTests(unittest.TestCase):
         self.assertIn("- `blob.bin` (type changed; +1 -0; 1 hunks; binary)", pack)
         self.assertIn("+    1| data.txt", pack)
 
+    def test_an_arrow_function_with_a_trailing_comment_encloses_its_body(self):
+        repo, base = two_commit(
+            {"math.ts": "export const total = (items: number[]) => { // sum items\n  let amount = 0;\n  return amount;\n};\n", "app.ts": 'import { total } from "./math";\n\nexport const value = total([]);\n'},
+            {"math.ts": "export const total = (items: number[]) => { // sum items\n  let amount = 1;\n  return amount;\n};\n", "app.ts": 'import { total } from "./math";\n\nexport const value = total([]);\n'})
+        pack = repo.pack(base)
+        self.assertIn("- `total` (changed function at math.ts:1): 2 references", pack)
+        self.assertIn("    - app.ts:3: export const value = total([]);", pack)
+
+    def test_a_one_line_block_encloses_nothing_below_it(self):
+        repo, base = two_commit(
+            {"math.ts": "export const computeTotal = (items: number[]) => { return items.length; };\nexport const total = (items: number[]) => 0;\n"},
+            {"math.ts": "export const computeTotal = (items: number[]) => { return items.length; };\nexport const total = (items: number[]) => computeTotal(items);\n"})
+        pack = repo.pack(base)
+        self.assertIn("### `computeTotal` (called at math.ts:2): 1 definition", pack)
+
 
 if __name__ == "__main__":
     unittest.main()

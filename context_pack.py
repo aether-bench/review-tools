@@ -423,16 +423,19 @@ def main() -> int:
     def_on_line_re = re.compile(r"(?:^|[^\w$.])(?:def|func|function|fn|class|module|interface|type|struct|enum|record)\s+(?:\([^)]*\)\s*)?\*?([A-Za-z_$][\w$]*)")
     # a binding whose value is a function: `export const total = (items: number[]) => {`, `const load = async function (`
     bound_fn_re = re.compile(r"(?:^|[\s,(])(?:const|let|var|val)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]*)?=\s*(?:async\s*)?(?:function\b|\([^()]*\)\s*(?::[^=]*)?=>|[A-Za-z_$][\w$]*\s*=>)")
+    trailing_comment_re = re.compile(r"\s+(?://|#)[^\"'`]*$|\s*/\*(?:(?!\*/).)*\*/\s*$")
 
     def declared_on(text: str) -> tuple:
-        """(name the line declares or None, whether its body continues past the line): a one-line arrow function
-        encloses nothing below it."""
+        """(name the line declares or None, whether its body continues past the line). A bound function whose block
+        opens on the line and does not close there, or whose parameters or arrow run on, encloses the lines below; a
+        one-line arrow function or a one-line block does not. A trailing comment is not part of the code."""
         m = def_on_line_re.search(text)
         if m and m.group(1) not in KEYWORDS and len(m.group(1)) >= 3:
             return m.group(1), True
         m = bound_fn_re.search(text)
         if m and m.group(1) not in KEYWORDS and len(m.group(1)) >= 3:
-            return m.group(1), text.rstrip().endswith(("{", "(", ",", "=>"))
+            code = trailing_comment_re.sub("", text).rstrip()
+            return m.group(1), code.count("{") > code.count("}") or code.endswith(("(", ",", "=>"))
         return None, False
 
     for fd in files.values():
