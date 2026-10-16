@@ -241,8 +241,8 @@ class ContextPackTests(unittest.TestCase):
 
     def test_a_division_after_a_postfix_operator_is_not_a_regex(self):
         repo, base = two_commit(
-            {"math.ts": "export const ratio = (value: number | null) => { return value! / 2; };\nexport const half = (i: number) => { i++ / 2; return i; };\nexport const wrap = (v: number) => v;\n"},
-            {"math.ts": "export const ratio = (value: number | null) => { return value! / 2; };\nexport const half = (i: number) => { i++ / 2; return i; };\nexport const wrap = (v: number) => ratio(v) + half(v);\n"})
+            {"math.ts": "export const ratio = (value: number) => { return value! / 2; };\nexport const half = (i: number) => { i++ / 2; return i; };\nexport const wrap = (v: number) => v;\n"},
+            {"math.ts": "export const ratio = (value: number) => { return value! / 2; };\nexport const half = (i: number) => { i++ / 2; return i; };\nexport const wrap = (v: number) => ratio(v) + half(v);\n"})
         pack = repo.pack(base)
         self.assertIn("### `ratio` (called at math.ts:3): 1 definition", pack)
         self.assertIn("### `half` (called at math.ts:3): 1 definition", pack)
