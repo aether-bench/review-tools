@@ -458,11 +458,12 @@ def main() -> int:
                 j = i + 1
                 while j < n and text[j] != c:
                     j += 2 if text[j] == "\\" else 1
-                if j >= n and c == "`":  # the template runs on to the next line
-                    out.append(c)
-                    return "".join(out), True
-                if j >= n:  # a quote with no partner is text (an apostrophe in JSX), not a string
-                    out.append(" ")
+                if j >= n:
+                    continued = (len(text) - len(text.rstrip("\\"))) % 2 == 1  # an escaped newline continues the string
+                    if c == "`" or continued:  # the literal runs on to the next line
+                        out.append(c)
+                        return "".join(out), True
+                    out.append(" ")  # a quote with no partner is text (an apostrophe in JSX), not a string
                     i += 1
                     continue
                 out.append(c + c)

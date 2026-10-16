@@ -261,6 +261,14 @@ class ContextPackTests(unittest.TestCase):
         pack = repo.pack(base)
         self.assertIn("### `Note` (called at app.tsx:2): 1 definition", pack)
 
+    def test_a_string_continued_by_an_escaped_newline_keeps_its_function_open(self):
+        repo, base = two_commit(
+            {"math.ts": 'export const banner = () => "first \\\n  second";\n', "app.ts": 'import { banner } from "./math";\n\nexport const page = banner();\n'},
+            {"math.ts": 'export const banner = () => "first \\\n  changed";\n', "app.ts": 'import { banner } from "./math";\n\nexport const page = banner();\n'})
+        pack = repo.pack(base)
+        self.assertIn("- `banner` (changed function at math.ts:1): 2 references", pack)
+        self.assertIn("    - app.ts:3: export const page = banner();", pack)
+
 
 if __name__ == "__main__":
     unittest.main()
