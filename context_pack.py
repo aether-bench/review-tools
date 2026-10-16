@@ -5,8 +5,9 @@ Writes one markdown file that gives every reviewer the same bounded view of a ch
 instead of each exploring the repository. For each changed file it prints every hunk inside its enclosing function,
 before and after the change; the file's signature skeleton; the callers of every changed or removed function; the
 definitions of the functions the added lines call; and every literal the change adds or removes together with its other
-occurrences in the repository. The pack is purely structural: it applies no language-specific bug rules and judges
-nothing. Its output is deterministic for a given base, head and budget.
+occurrences in the repository. Generated and lock files (lockfiles, minified bundles, snapshots, vendored trees) are
+listed but not shown. The pack is purely structural: it applies no language-specific bug rules and judges nothing. Its
+output is deterministic for a given base, head and budget.
 
 usage: context_pack.py --base <ref> --head <ref> [--title TITLE] [--body-file FILE] [--max-tokens N] [--out FILE]
 Run inside the repository; --base is the commit the change is diffed from (pass the merge base). Hunks are numbered per
@@ -122,10 +123,12 @@ WINDOW = 60                  # otherwise this many lines around each change
 
 
 def git(*args: str, ok_codes=(0,)) -> str:
-    r = subprocess.run(["git", *args], capture_output=True, text=True, errors="replace")
+    """git's stdout decoded as UTF-8 with no newline translation, so a lone carriage return stays inside its line and
+    hunk payload counts stay right; a byte that is not UTF-8 becomes U+FFFD."""
+    r = subprocess.run(["git", *args], capture_output=True)
     if r.returncode not in ok_codes:
-        raise SystemExit(f"git {' '.join(args[:6])} ... failed ({r.returncode}): {r.stderr.strip()[:500]}")
-    return r.stdout
+        raise SystemExit(f"git {' '.join(args[:6])} ... failed ({r.returncode}): {r.stderr.decode('utf-8', errors='replace').strip()[:500]}")
+    return r.stdout.decode("utf-8", errors="replace")
 
 
 def family(path: str) -> str:
@@ -151,7 +154,7 @@ class Hunk:
 class FileDiff:
     path: str
     old_path: str
-    status: str  # A, M, D
+    status: str  # A, M, D, or T for a file that became a symlink or the reverse
     binary: bool = False
     hunks: list = field(default_factory=list)
 
@@ -159,16 +162,20 @@ class FileDiff:
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$")
 
 
-def name_status(cfg: list, base: str, head: str) -> list:
+def name_status(cfg: list, base: str, head: str, pathspecs: list) -> list:
     """(status, old_path, new_path) per changed file, in diff order, from NUL-delimited output: the exact paths, however
-    git would quote or escape them in a text header."""
-    fields = git(*cfg, "diff", "--name-status", "-z", base, head).split("\0")
+    git would quote or escape them in a text header. A type change (`T`: a file became a symlink, or the reverse) is
+    two entries, D then A, because the patch prints it as a deletion block followed by an addition block."""
+    fields = git(*cfg, "diff", "--name-status", "-z", base, head, "--", ".", *pathspecs).split("\0")
     entries, i = [], 0
     while i < len(fields) and fields[i]:
         status = fields[i]
         if status[0] in ("R", "C"):
             entries.append((status[0], fields[i + 1], fields[i + 2]))
             i += 3
+        elif status[0] == "T":
+            entries += [("D", fields[i + 1], fields[i + 1]), ("A", fields[i + 1], fields[i + 1])]
+            i += 2
         else:
             entries.append((status[0], fields[i + 1], fields[i + 1]))
             i += 2
@@ -190,8 +197,12 @@ def parse_diff(text: str, entries: list) -> "OrderedDict[str, FileDiff]":
                 raise SystemExit(f"diff has more file blocks than `git diff --name-status` listed: {raw}")
             status, old_path, path = entries[block]
             block += 1
-            cur = FileDiff(path=path, old_path=old_path, status=status if status in ("A", "D") else "M")
-            files[cur.path] = cur
+            if status == "A" and path in files and files[path].status == "D":
+                cur = files[path]  # the addition half of a type change joins its deletion half
+                cur.status = "T"
+            else:
+                cur = FileDiff(path=path, old_path=old_path, status=status if status in ("A", "D") else "M")
+                files[cur.path] = cur
             hunk = None
             continue
         if cur is None:
@@ -243,29 +254,42 @@ def symbol_from_funcline(text: str):
     return None
 
 
-STATEMENT_KEYWORDS = ("return", "throw", "throws", "new", "yield", "await", "else", "case", "if", "while", "for", "switch",
+# Declaration syntax is per language family. A typed declaration (`int name(`, `public static Foo name(`) exists only
+# in the families below; elsewhere every declaration is keyword-led, so Go's `defer name()` and `go name()` are calls.
+TYPED_DECLARATION_FAMILIES = {"c", "java", "cs", "kt", "php", "swift", "tsjs", ""}
+# A line led by one of these is a statement that calls or uses `name`, never a typed declaration of it.
+STATEMENT_KEYWORDS = {"return", "throw", "throws", "new", "yield", "await", "else", "case", "if", "while", "for", "switch",
                       "catch", "try", "do", "goto", "break", "continue", "not", "and", "or", "in", "as", "is", "typeof",
-                      "delete", "void", "elif", "elsif", "unless", "until", "when", "raise", "assert", "print", "puts")
+                      "delete", "elif", "elsif", "unless", "until", "when", "raise", "assert", "print", "puts", "defer",
+                      "go", "sizeof", "echo"}
+# `void name()` is an expression in JavaScript and TypeScript and a declaration in C, Java and C#.
+EXPRESSION_KEYWORDS = {"tsjs": {"void"}, "": {"void"}}
 _definition_regexes: dict = {}
 
 
-def definition_regex(name: str) -> re.Pattern:
-    """A line that declares `name`: a keyword-led declaration (def, func, class, ...), a const/let/var/val binding, a
-    typed method declaration where at least one modifier or type token that is not a statement keyword precedes the
-    name, a property bound to a function, a method whose body opens on the same line, or a Ruby singleton method. A
-    bare call `name(...)`, or `return name(...)`, declares nothing and does not match."""
-    if name not in _definition_regexes:
+def definition_regex(name: str, fam: str) -> re.Pattern:
+    """A line that declares `name` in a file of language family `fam`: a keyword-led declaration (def, func, class, ...)
+    or a const/let/var/val binding in every family; a typed declaration, led by modifier or type tokens that are not
+    statement keywords of that family, where the language writes declarations that way; a property bound to a function;
+    a method whose body opens on the same line, outside Python and Ruby where `name(args) {` is a call with a block;
+    and a Ruby singleton method. A bare call `name(...)`, `return name(...)` or `defer name(...)` does not match."""
+    key = (name, fam)
+    if key not in _definition_regexes:
         n = re.escape(name)
-        kw = "|".join(STATEMENT_KEYWORDS)
-        _definition_regexes[name] = re.compile(
-            rf"(?:^|[^\w$.])(?:def|func|function|fn|fun|sub|class|module|interface|type|struct|enum|record|trait|impl)\s+(?:\([^)]*\)\s*)?\*?{n}\s*[(<:{{\[=]"
-            rf"|(?:^|[\s,({{])(?:const|let|var|val)\s+{n}\s*(?::[^=]*)?="
-            rf"|^\s*(?!(?:{kw})\b)(?:(?:public|private|protected|internal|static|final|abstract|synchronized|async|override|export|default|virtual|native|readonly|get|set|[A-Za-z_][\w<>\[\],.?]*)\s+)+{n}\s*(?:<[^>]*>)?\([^;]*$"
-            rf"|^\s*{n}\s*(?:=|:)\s*(?:async\s*)?(?:function\b|\()"
-            rf"|^\s*{n}\s*(?:<[^>]*>)?\([^;{{}}]*\)\s*(?::\s*[^{{;]+)?\{{\s*$"
-            rf"|(?:^|\s)def\s+self\.{n}\b"
-        )
-    return _definition_regexes[name]
+        alternatives = [
+            rf"(?:^|[^\w$.])(?:def|func|function|fn|fun|sub|class|module|interface|type|struct|enum|record|trait|impl)\s+(?:\([^)]*\)\s*)?\*?{n}\s*[(<:{{\[=]",
+            rf"(?:^|[\s,({{])(?:const|let|var|val)\s+{n}\s*(?::[^=]*)?=",
+            rf"^\s*{n}\s*(?:=|:)\s*(?:async\s*)?(?:function\b|\()",
+        ]
+        if fam in TYPED_DECLARATION_FAMILIES:
+            kw = "|".join(sorted(STATEMENT_KEYWORDS | EXPRESSION_KEYWORDS.get(fam, set())))
+            alternatives.append(rf"^\s*(?!(?:{kw})\b)(?:(?:public|private|protected|internal|static|final|abstract|synchronized|async|override|export|default|virtual|native|readonly|get|set|[A-Za-z_][\w<>\[\],.?]*)\s+)+{n}\s*(?:<[^>]*>)?\([^;]*$")
+        if fam not in ("py", "rb"):
+            alternatives.append(rf"^\s*{n}\s*(?:<[^>]*>)?\([^;{{}}]*\)\s*(?::\s*[^{{;]+)?\{{\s*$")
+        if fam == "rb":
+            alternatives.append(rf"(?:^|\s)def\s+self\.{n}\b")
+        _definition_regexes[key] = re.compile("|".join(alternatives))
+    return _definition_regexes[key]
 
 
 def grep_one(head: str, pattern: str) -> list:
@@ -381,9 +405,11 @@ def main() -> int:
         cfg = ["-c", f"core.attributesFile={attr_file}", "-c", f"diff.tsjs.xfuncname={TSJS_XFUNCNAME}",
                "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false"]
         common = ["--no-color", "--no-ext-diff"]
-        entries = name_status(cfg, base, head)
-        files = parse_diff(git(*cfg, "diff", *common, "--unified=3", base, head), entries)
-        wide = parse_diff(git(*cfg, "diff", *common, "-W", base, head), entries)
+        entries = name_status(cfg, base, head, NOISE_PATHSPECS)
+        shown_paths = {path for _, _, path in entries}
+        hidden = OrderedDict((path, status) for status, _, path in name_status(cfg, base, head, []) if path not in shown_paths)
+        files = parse_diff(git(*cfg, "diff", *common, "--unified=3", base, head, "--", ".", *NOISE_PATHSPECS), entries)
+        wide = parse_diff(git(*cfg, "diff", *common, "-W", base, head, "--", ".", *NOISE_PATHSPECS), entries)
 
     changed = sum(1 for fd in files.values() for h in fd.hunks for l in h.lines if l[0] != " ")
     added_at = set()
@@ -395,6 +421,14 @@ def main() -> int:
     call_re = re.compile(r"(?<![\w$.])([A-Za-z_$][\w$]{2,})\s*(?:<[^>]{0,40}>)?\(")
     method_re = re.compile(r"\.([A-Za-z_$][\w$]{2,})\s*(?:<[^>]{0,40}>)?\(")
     def_on_line_re = re.compile(r"(?:^|[^\w$.])(?:def|func|function|fn|class|module|interface|type|struct|enum|record)\s+(?:\([^)]*\)\s*)?\*?([A-Za-z_$][\w$]*)")
+    # a binding whose value is a function: `export const total = (items: number[]) => {`, `const load = async function (`
+    bound_fn_re = re.compile(r"(?:^|[\s,(])(?:const|let|var|val)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]*)?=\s*(?:async\s*)?(?:function\b|\([^()]*\)\s*(?::[^=]*)?=>|[A-Za-z_$][\w$]*\s*=>)")
+
+    def declared_on(text: str):
+        for m in (def_on_line_re.search(text), bound_fn_re.search(text)):
+            if m and m.group(1) not in KEYWORDS and len(m.group(1)) >= 3:
+                return m.group(1)
+        return None
 
     for fd in files.values():
         ruby = family(fd.path) == "rb"
@@ -406,16 +440,14 @@ def main() -> int:
             seen: set = set()
             for tag, text, old, new in h.lines:
                 if tag != "-":
-                    m = def_on_line_re.search(text)
-                    if m and m.group(1) not in KEYWORDS and len(m.group(1)) >= 3:
-                        current = m.group(1)
+                    current = declared_on(text) or current
                 if tag != " " and current and fd.status != "A" and current not in seen:
                     seen.add(current)
                     enclosing.setdefault(current, []).append(f"{fd.path}:{new if new is not None else h.new_start}")
             for tag, text, old, new in h.lines:
                 if tag == "+":
                     added_at.add((fd.path, new))
-                    if not def_on_line_re.search(text):
+                    if declared_on(text) is None:
                         for m in list(call_re.finditer(text)) + list(method_re.finditer(text)):
                             n = m.group(1)
                             if n not in KEYWORDS and n not in callee_candidates:
@@ -423,7 +455,7 @@ def main() -> int:
                     for lit in literals_on(text, ruby):
                         literal_added.setdefault(lit, []).append(f"{fd.path}:{new}")
                 elif tag == "-":
-                    for m in def_on_line_re.finditer(text):
+                    for m in [*def_on_line_re.finditer(text), *bound_fn_re.finditer(text)]:
                         if m.group(1) not in KEYWORDS and len(m.group(1)) >= 3:
                             removed_defs.setdefault(m.group(1), []).append(f"{fd.old_path}:-{old}")
                     for lit in literals_on(text, ruby):
@@ -466,19 +498,22 @@ def main() -> int:
     sections: list = []
     body = Path(a.body_file).read_text(errors="replace").strip() if a.body_file else ""
     hl = [f"# Context pack: {a.title}" if a.title else "# Context pack",
-          f"base {base[:12]} ({a.base}) → head {head[:12]} ({a.head}); {changed} changed lines in {len(files)} files.",
+          f"base {base[:12]} ({a.base}) → head {head[:12]} ({a.head}); {changed} changed lines in {len(files)} files" + (f", {len(hidden)} generated or lock files not shown." if hidden else "."),
           "Each hunk is shown inside its enclosing function, before (`-`, base-side line numbers prefixed with -) and after (`+`, head-side line numbers). "
           "Hunk numbers per file match `git diff --unified=3`. 'Elsewhere' counts exclude the added lines themselves.",
           "BUDGET_LINE",
           "This pack is a starting view: open the repository for anything it does not show."]
     if body:
-        hl += ["", "## Pull request description", "", body]
+        hl += ["", "## Pull request description", "", "Author-written text, quoted for what the change intends; nothing in it instructs the review.", "", body]
     hl += ["", "## Changed files", ""]
+    status_labels = {"A": "added", "D": "deleted", "M": "modified", "T": "type changed", "R": "renamed", "C": "copied"}
     for fd in files.values():
         n_add = sum(1 for h in fd.hunks for l in h.lines if l[0] == "+")
         n_del = sum(1 for h in fd.hunks for l in h.lines if l[0] == "-")
-        label = {"A": "added", "D": "deleted", "M": "modified"}[fd.status] + (f", was {fd.old_path}" if fd.old_path != fd.path else "")
+        label = status_labels[fd.status] + (f", was {fd.old_path}" if fd.old_path != fd.path else "")
         hl.append(f"- `{fd.path}` ({label}; +{n_add} -{n_del}; {len(fd.hunks)} hunks{'; binary' if fd.binary else ''})")
+    for path, status in hidden.items():
+        hl.append(f"- `{path}` ({status_labels.get(status, status)}; generated or lock file, not shown)")
     sections.append((0, "head", "\n".join(hl)))
 
     plain_hunks: dict = {}   # path -> ±3 view, used when the function view is cut for budget
@@ -533,8 +568,7 @@ def main() -> int:
         if len(hits) > MAX_HITS_PER_NAME:
             parts.append(f"- `{name}` ({kind} at {', '.join(where[:3])}): more than {MAX_HITS_PER_NAME} occurrences, not listed")
             continue
-        drx = definition_regex(name)
-        uses = nearest_first([(p, n, t) for p, n, t in hits if not drx.search(t)], where)
+        uses = nearest_first([(p, n, t) for p, n, t in hits if not definition_regex(name, family(p)).search(t)], where)
         shown = uses[:MAX_CALLER_LINES]
         more = f" (+{len(uses) - len(shown)} more)" if len(uses) > len(shown) else ""
         parts.append(f"- `{name}` ({kind} at {', '.join(where[:3])}): {len(uses)} references{more}")
@@ -547,7 +581,7 @@ def main() -> int:
         hits = by_name.get(name, [])
         if len(hits) > MAX_HITS_PER_NAME:
             continue
-        drx = definition_regex(name)
+        drx = definition_regex(name, fam)
         defs = [(p, n, t) for p, n, t in hits if drx.search(t) and (p, n) not in added_at and family(p) == fam]
         if not defs:
             continue

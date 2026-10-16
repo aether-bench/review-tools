@@ -26,6 +26,9 @@ class Repo:
             target.parent.mkdir(parents=True, exist_ok=True)
             if body is None:
                 target.unlink()
+            elif body.startswith("->"):  # a symlink to the rest of the body
+                target.unlink(missing_ok=True)
+                target.symlink_to(body[2:])
             else:
                 target.write_text(body)
         self.git("add", "-A")
@@ -41,7 +44,8 @@ class Repo:
             assert r.returncode != 0, "expected the tool to fail"
             return r.stderr
         assert r.returncode == 0, r.stderr
-        return out.read_text()
+        with out.open(newline="") as f:  # no newline translation: a carriage return in the pack is read as one
+            return f.read()
 
 
 def two_commit(base_files: dict, head_files: dict):
@@ -120,6 +124,52 @@ class ContextPackTests(unittest.TestCase):
             self.assertEqual(os.listdir(tmp), [])
         pack = repo.pack(base, env={"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "diff.noprefix", "GIT_CONFIG_VALUE_0": "true"})
         self.assertIn("- `a.py` (modified; +1 -1; 1 hunks)", pack)
+
+    def test_a_lone_carriage_return_stays_inside_its_line(self):
+        repo, base = two_commit({"data.txt": "second\rA 3\n"}, {"data.txt": "second\rB 3\n"})
+        pack = repo.pack(base)
+        self.assertIn("- `data.txt` (modified; +1 -1; 1 hunks)", pack)
+        self.assertIn("+    1| second\rB 3", pack)
+
+    def test_a_file_that_became_a_symlink_is_one_type_change(self):
+        repo, base = two_commit({"link": "hello\n", "data.txt": "x\n"}, {"link": "->data.txt"})
+        pack = repo.pack(base)
+        self.assertIn("- `link` (type changed; +1 -1; 2 hunks)", pack)
+        self.assertIn("-   -1| hello", pack)
+        self.assertIn("+    1| data.txt", pack)
+
+    def test_generated_and_lock_files_are_listed_but_not_shown(self):
+        repo, base = two_commit(
+            {"a.py": "x = 1\n", "package-lock.json": '{"a": 1}\n'},
+            {"a.py": "x = 2\n", "package-lock.json": '{"a": 2}\n'})
+        pack = repo.pack(base)
+        self.assertIn("2 changed lines in 1 files, 1 generated or lock files not shown.", pack)
+        self.assertIn("- `package-lock.json` (modified; generated or lock file, not shown)", pack)
+        self.assertNotIn('{"a": 2}', pack)
+
+    def test_a_deferred_call_is_a_reference_not_a_declaration(self):
+        repo, base = two_commit(
+            {"a.go": "package a\n\nfunc notifyReady() {\n}\n\nfunc run() {\n\tdefer notifyReady()\n}\n"},
+            {"a.go": "package a\n\nfunc notifyReady() {\n\tprintln(1)\n}\n\nfunc run() {\n\tdefer notifyReady()\n}\n"})
+        pack = repo.pack(base)
+        self.assertIn("- `notifyReady` (changed function at a.go:4): 1 references", pack)
+        self.assertIn("    - a.go:8: defer notifyReady()", pack)
+
+    def test_a_c_void_function_is_a_definition(self):
+        repo, base = two_commit(
+            {"svc.c": "void notify_ready(void) {\n  return;\n}\n", "main.c": "int main(void) {\n  return 0;\n}\n"},
+            {"svc.c": "void notify_ready(void) {\n  return;\n}\n", "main.c": "int main(void) {\n  notify_ready();\n  return 0;\n}\n"})
+        pack = repo.pack(base)
+        self.assertIn("### `notify_ready` (called at main.c:2): 1 definition", pack)
+        self.assertIn("1| void notify_ready(void) {", pack)
+
+    def test_a_top_of_file_arrow_function_is_the_enclosing_function(self):
+        repo, base = two_commit(
+            {"math.ts": "export const total = (items: number[]) => {\n  let amount = 0;\n  return amount;\n};\n", "app.ts": 'import { total } from "./math";\n\nexport const value = total([]);\n'},
+            {"math.ts": "export const total = (items: number[]) => {\n  let amount = 1;\n  return amount;\n};\n", "app.ts": 'import { total } from "./math";\n\nexport const value = total([]);\n'})
+        pack = repo.pack(base)
+        self.assertIn("- `total` (changed function at math.ts:1): 2 references", pack)
+        self.assertIn("    - app.ts:3: export const value = total([]);", pack)
 
 
 if __name__ == "__main__":
